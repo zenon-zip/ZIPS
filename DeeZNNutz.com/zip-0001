@@ -1,0 +1,203 @@
+| Field | Description |
+| ----- | ----------- |
+| ZIP | - |
+| Title | Configurable Node Discovery and Static Nodes |
+| Author | @0x3639 |
+| Status | DRAFT |
+| Type | Protocol |
+| Created | 2025-04-05 |
+| License | BSD-2-Clause |
+| License-Code | GPL v3.0 |
+| Comments-URI | - |
+
+# Table of Contents
+1. [Abstract](#abstract)
+2. [Motivation](#motivation)
+3. [Specification](#specification)
+4. [Rationale](#rationale)
+5. [Reference Implementation](#reference-implementation)
+
+# Abstract
+
+This ZIP proposes making node discovery and static node configuration configurable through the node's `config.json` file. Currently, these settings are hardcoded in the node implementation, with discovery always enabled and no static nodes configured. The proposal adds new configuration options to allow users to control these settings, providing more flexibility in how nodes connect to the network.
+
+# Motivation
+
+The current implementation is unable to set discoverability and static nodes in the `config.json` file:
+
+1. Node discovery is always enabled, which may not be desirable in all network configurations
+2. Static nodes cannot be configured, forcing nodes to rely solely on discovery
+3. Users have limited control over their node's connection strategy
+4. Network operators cannot enforce specific node connections
+
+This ZIP aims to solve these issues by making these settings configurable, allowing for:
+- More flexible network topologies
+- Better control over node connections
+- Improved network security through controlled peer connections
+- Support for private networks with specific node requirements
+
+# Specification
+
+## Configuration Structure
+
+The following fields are added to the `Net` section of `config.json`:
+
+```json
+{
+    "Net": {
+        "ListenHost": "0.0.0.0",
+        "ListenPort": 35995,
+        "MaxPeers": 60,
+        "MinConnectedPeers": 16,
+        "MaxPendingPeers": 10,
+        "Discovery": true, //added field
+        "StaticNodes": [ //added field
+            "enode://<node-id>@<ip>:<port>",
+            "enode://<node-id>@<ip>:<port>"
+        ],
+        "Seeders": [
+            "enode://<node-id>@<ip>:<port>"
+        ]
+    }
+}
+```
+
+### Configuration Fields
+
+| Field | Type | Default | Description |
+| ----- | ---- | ------- | ----------- |
+| Discovery | boolean | true | Whether to enable node discovery |
+| StaticNodes | []string | [] | List of static nodes to maintain connections with |
+
+## Node URL Format
+
+Static nodes must be specified using the enode URL format:
+```
+enode://<node-id>@<ip>:<port>
+```
+
+Where:
+- `<node-id>` is the 64-byte public key of the node
+- `<ip>` is the IP address of the node
+- `<port>` is the TCP port the node is listening on
+
+## Implementation Details
+
+### 1. NetConfig Structure Update
+
+The `NetConfig` structure in `node/config.go` is updated to include the new fields:
+
+```go
+type NetConfig struct {
+    ListenHost string
+    ListenPort int
+
+    MinPeers          int
+    MinConnectedPeers int
+    MaxPeers          int
+    MaxPendingPeers   int
+
+    Discovery    bool     // New field
+    StaticNodes  []string // New field
+    Seeders      []string
+}
+```
+
+### 2. Server Configuration
+
+The `makeNetConfig` function in `node/config.go` is updated to include the new fields:
+
+```go
+func (c *Config) makeNetConfig() *p2p.Net {
+    networkDataDir := filepath.Join(c.DataPath, p2p.DefaultNetDirName)
+    privateKeyFile := filepath.Join(c.DataPath, p2p.DefaultNetPrivateKeyFile)
+
+    return &p2p.Net{
+        PrivateKeyFile:    privateKeyFile,
+        MaxPeers:          c.Net.MaxPeers,
+        MaxPendingPeers:   c.Net.MaxPendingPeers,
+        MinConnectedPeers: c.Net.MinConnectedPeers,
+        Name:              fmt.Sprintf("%v %v", metadata.Version, c.Name),
+        Discovery:         c.Net.Discovery,    // New field
+        StaticNodes:       c.Net.StaticNodes,  // New field
+        Seeders:           c.Net.Seeders,
+        NodeDatabase:      networkDataDir,
+        ListenAddr:        c.Net.ListenHost,
+        ListenPort:        c.Net.ListenPort,
+    }
+}
+```
+
+### 3. Node Initialization
+
+The node initialization in `node/node.go` is updated to parse and use static nodes:
+
+```go
+func NewNode(conf *Config) (*Node, error) {
+    // ... existing code ...
+
+    netConfig := conf.makeNetConfig()
+    nodes, err := netConfig.Nodes()
+    if err != nil {
+        return nil, errors.Errorf("Unable to parse seeders. Reason: %v", err)
+    }
+
+    // Parse static nodes
+    var staticNodes []*discover.Node
+    if len(netConfig.StaticNodes) > 0 {
+        staticNodes = make([]*discover.Node, len(netConfig.StaticNodes))
+        for i, nodeStr := range netConfig.StaticNodes {
+            staticNodes[i], err = discover.ParseNode(nodeStr)
+            if err != nil {
+                return nil, errors.Errorf("Unable to parse static node %s. Reason: %v", nodeStr, err)
+            }
+        }
+    }
+
+    node.server = &p2p.Server{
+        PrivateKey:        netConfig.PrivateKey(),
+        Name:              netConfig.Name,
+        MaxPeers:          netConfig.MaxPeers,
+        MinConnectedPeers: netConfig.MinConnectedPeers,
+        MaxPendingPeers:   netConfig.MaxPendingPeers,
+        Discovery:         netConfig.Discovery,    // Use config value
+        NoDial:            false,
+        StaticNodes:       staticNodes,           // Use parsed static nodes
+        BootstrapNodes:    nodes,
+        TrustedNodes:      nil,
+        NodeDatabase:      netConfig.NodeDatabase,
+        ListenAddr:        fmt.Sprintf("%v:%v", netConfig.ListenAddr, netConfig.ListenPort),
+        Protocols:         node.z.Protocol().SubProtocols,
+    }
+    return node, nil
+}
+```
+
+# Rationale
+
+### Discovery Configuration
+
+Making discovery configurable allows users to:
+- Run nodes in private networks without discovery
+- Reduce network traffic by disabling discovery when not needed
+- Improve security by controlling how nodes find peers
+
+### Static Nodes
+
+Static nodes provide:
+- Guaranteed connections to specific nodes
+- Support for private networks with known peers
+- Better control over network topology
+- Improved reliability in specific network configurations
+
+### Implementation Approach
+
+The implementation leverages existing node parsing functionality that's already used for seeders, ensuring:
+- Consistent node URL parsing
+- Proven and tested code paths
+- Minimal new code required
+- Easy maintenance
+
+# Reference Implementation
+
+The reference implementation is provided in the code snippets above. The changes are minimal and leverage existing functionality, making them easy to implement and maintain.
